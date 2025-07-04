@@ -10,10 +10,29 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Download, ArrowLeft, CheckCircle, AlertTriangle, TrendingUp, FileText, Target, Lightbulb } from "lucide-react"
 import { useRouter } from "next/navigation"
 
-async function parseApiResponse(res: Response) {
-  const ct = res.headers.get("content-type") || ""
-  if (ct.includes("application/json")) return res.json()
-  return { error: await res.text() }
+// Client-side Groq API integration
+const makeGroqRequest = async (apiKey: string, prompt: string, maxTokens = 1500) => {
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "llama3-70b-8192",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: maxTokens,
+      temperature: 0.7,
+    }),
+  })
+
+  if (!response.ok) {
+    const error = await response.json()
+    throw new Error(error.error?.message || "API request failed")
+  }
+
+  const data = await response.json()
+  return data.choices[0]?.message?.content || ""
 }
 
 interface AnalysisResult {
@@ -43,25 +62,32 @@ export default function OptimizePage() {
   }, [router])
 
   const handleRegenerateCV = async () => {
+    const apiKey = localStorage.getItem("groq_api_key")
+    if (!apiKey) {
+      alert("API key not found. Please go back and configure your API key.")
+      return
+    }
+
     setIsGenerating(true)
     try {
-      const sessionApiKey = sessionStorage.getItem("groq_api_key")
-      const response = await fetch("/api/regenerate-cv", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          currentCV: optimizedCV,
-          apiKey: sessionApiKey,
-        }),
-      })
+      const regenerationPrompt = `
+Please improve and refine this CV to make it even more ATS-friendly and professional:
 
-      if (response.ok) {
-        const result = await parseApiResponse(response)
-        setOptimizedCV(result.optimizedCV)
-      } else {
-        const err = await parseApiResponse(response)
-        alert(`Regeneration failed: ${err.error ?? err.message ?? "Unknown error"}`)
-      }
+Current CV:
+${optimizedCV}
+
+Improvements to make:
+1. Better keyword optimization
+2. Improved formatting for ATS systems
+3. Stronger action verbs and quantified achievements
+4. Better section organization
+5. More compelling professional summary
+
+Return the improved CV maintaining all the original information but with better presentation and optimization.
+`
+
+      const response = await makeGroqRequest(apiKey, regenerationPrompt, 1800)
+      setOptimizedCV(response)
     } catch (error) {
       console.error("Error regenerating CV:", error)
       alert("Error regenerating CV. Please try again.")
@@ -70,32 +96,27 @@ export default function OptimizePage() {
     }
   }
 
-  const handleDownloadCV = async () => {
-    try {
-      const response = await fetch("/api/download-cv", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cvContent: optimizedCV }),
-      })
-
-      if (response.ok) {
-        const blob = await response.blob()
-        const url = window.URL.createObjectURL(blob)
-        const a = document.createElement("a")
-        a.href = url
-        a.download = "optimized-cv.pdf"
-        document.body.appendChild(a)
-        a.click()
-        window.URL.revokeObjectURL(url)
-        document.body.removeChild(a)
-      }
-    } catch (error) {
-      console.error("Error downloading CV:", error)
-    }
+  const handleDownloadCV = () => {
+    const blob = new Blob([optimizedCV], { type: "text/plain" })
+    const url = window.URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = "optimized-cv.txt"
+    document.body.appendChild(a)
+    a.click()
+    window.URL.revokeObjectURL(url)
+    document.body.removeChild(a)
   }
 
   if (!analysisResult) {
-    return <div>Loading...</div>
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-4"></div>
+          <p>Loading analysis results...</p>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -187,7 +208,7 @@ export default function OptimizePage() {
                   </Button>
                   <Button onClick={handleDownloadCV} variant="outline">
                     <Download className="w-4 h-4 mr-2" />
-                    Download PDF
+                    Download TXT
                   </Button>
                 </div>
               </CardContent>

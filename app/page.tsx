@@ -13,10 +13,53 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Upload, FileText, Target, Zap, CheckCircle, Key, AlertCircle } from "lucide-react"
 import { useRouter } from "next/navigation"
 
-async function parseApiResponse(res: Response) {
-  const ct = res.headers.get("content-type") || ""
-  if (ct.includes("application/json")) return res.json()
-  return { error: await res.text() }
+// Client-side Groq API integration
+const makeGroqRequest = async (apiKey: string, prompt: string, maxTokens = 1500) => {
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "llama3-70b-8192",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: maxTokens,
+      temperature: 0.7,
+    }),
+  })
+
+  if (!response.ok) {
+    const error = await response.json()
+    throw new Error(error.error?.message || "API request failed")
+  }
+
+  const data = await response.json()
+  return data.choices[0]?.message?.content || ""
+}
+
+// Text truncation helper
+const truncate = (txt: string, max: number) => (txt ?? "").replace(/\s+/g, " ").trim().slice(0, max)
+
+// JSON extraction helper
+const safeJsonParse = (raw: string) => {
+  const cleaned = raw.replace(/```(?:json)?/gi, "").trim()
+  const firstBrace = cleaned.indexOf("{")
+  const lastBrace = cleaned.lastIndexOf("}")
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+    throw new Error("No JSON object found")
+  }
+  return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1))
+}
+
+// File reading helper
+const readFileAsText = (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = (e) => resolve(e.target?.result as string)
+    reader.onerror = (e) => reject(e)
+    reader.readAsText(file)
+  })
 }
 
 export default function HomePage() {
@@ -25,33 +68,20 @@ export default function HomePage() {
   const [jobUrl, setJobUrl] = useState("")
   const [jobDescription, setJobDescription] = useState("")
   const [isLoading, setIsLoading] = useState(false)
-  const [apiKeyStatus, setApiKeyStatus] = useState<"checking" | "valid" | "invalid" | "missing">("checking")
-  const [showApiKeySetup, setShowApiKeySetup] = useState(false)
   const [apiKey, setApiKey] = useState("")
+  const [showApiKeySetup, setShowApiKeySetup] = useState(true)
   const [isValidatingKey, setIsValidatingKey] = useState(false)
+  const [apiKeyValid, setApiKeyValid] = useState(false)
   const router = useRouter()
 
   useEffect(() => {
-    checkApiKeyStatus()
-  }, [])
-
-  const checkApiKeyStatus = async () => {
-    try {
-      const response = await fetch("/api/check-api-key")
-      const result = await response.json()
-
-      if (result.hasApiKey) {
-        setApiKeyStatus("valid")
-      } else {
-        setApiKeyStatus("missing")
-        setShowApiKeySetup(true)
-      }
-    } catch (error) {
-      console.error("Error checking API key:", error)
-      setApiKeyStatus("missing")
-      setShowApiKeySetup(true)
+    const storedKey = localStorage.getItem("groq_api_key")
+    if (storedKey) {
+      setApiKey(storedKey)
+      setApiKeyValid(true)
+      setShowApiKeySetup(false)
     }
-  }
+  }, [])
 
   const handleApiKeySubmit = async () => {
     if (!apiKey.trim()) {
@@ -61,26 +91,15 @@ export default function HomePage() {
 
     setIsValidatingKey(true)
     try {
-      const response = await fetch("/api/validate-api-key", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiKey }),
-      })
+      // Test the API key with a simple request
+      await makeGroqRequest(apiKey, "Hello", 5)
 
-      const result = await response.json()
-
-      if (result.valid) {
-        setApiKeyStatus("valid")
-        setShowApiKeySetup(false)
-        // Store API key in session for this session
-        sessionStorage.setItem("groq_api_key", apiKey)
-      } else {
-        setApiKeyStatus("invalid")
-        alert("Invalid API key. Please check your Groq API key and try again.")
-      }
+      setApiKeyValid(true)
+      setShowApiKeySetup(false)
+      localStorage.setItem("groq_api_key", apiKey)
     } catch (error) {
-      console.error("Error validating API key:", error)
-      alert("Error validating API key. Please try again.")
+      console.error("API key validation failed:", error)
+      alert("Invalid API key. Please check your Groq API key and try again.")
     } finally {
       setIsValidatingKey(false)
     }
@@ -88,8 +107,18 @@ export default function HomePage() {
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
-    if (file && (file.type === "application/pdf" || file.type.includes("document"))) {
+    if (file && (file.type === "application/pdf" || file.type.includes("document") || file.type === "text/plain")) {
       setCvFile(file)
+    }
+  }
+
+  const fetchJobDescription = async (url: string): Promise<string> => {
+    try {
+      // For GitHub Pages, we can't fetch external URLs due to CORS
+      // Users will need to paste the job description manually
+      throw new Error("URL fetching not available in static deployment. Please copy and paste the job description.")
+    } catch (error) {
+      throw error
     }
   }
 
@@ -99,34 +128,68 @@ export default function HomePage() {
       return
     }
 
+    if (!apiKey) {
+      alert("Please configure your API key first")
+      return
+    }
+
     setIsLoading(true)
 
     try {
-      const formData = new FormData()
-      formData.append("cv", cvFile)
-      formData.append("experienceSummary", experienceSummary)
-      formData.append("jobUrl", jobUrl)
-      formData.append("jobDescription", jobDescription)
+      // Read CV file
+      const cvText = truncate(await readFileAsText(cvFile), 6000)
+      const expText = truncate(experienceSummary, 1000)
 
-      // Include API key from session if available
-      const sessionApiKey = sessionStorage.getItem("groq_api_key")
-      if (sessionApiKey) {
-        formData.append("apiKey", sessionApiKey)
+      let jdText = jobDescription
+      if (!jdText && jobUrl) {
+        try {
+          jdText = await fetchJobDescription(jobUrl)
+        } catch (error) {
+          alert(error.message)
+          setIsLoading(false)
+          return
+        }
       }
+      jdText = truncate(jdText || "", 3000)
 
-      const response = await fetch("/api/analyze-cv", {
-        method: "POST",
-        body: formData,
-      })
+      // Create prompt for analysis
+      const prompt = `
+You are an expert resume writer.
 
-      if (response.ok) {
-        const result = await parseApiResponse(response)
-        sessionStorage.setItem("analysisResult", JSON.stringify(result))
-        router.push("/optimize")
-      } else {
-        const err = await parseApiResponse(response)
-        throw new Error(err.error ?? err.message ?? "Analysis failed")
-      }
+Analyse the candidate's CV vs the Job Description and then produce an optimised, ATS-friendly CV.
+
+Return STRICT JSON matching exactly this shape (no markdown, no extras):
+
+{
+  "atsScore": <0-100>,
+  "matchScore": <0-100>,
+  "missingKeywords": [string],
+  "suggestions": [string],
+  "keywordDensity": { "keyword": percentNumber },
+  "optimizedCV": "<the full rewritten CV>"
+}
+
+--- INPUTS (some truncated) ---
+
+CV:
+${cvText}
+
+Experience Summary:
+${expText}
+
+Job Description:
+${jdText}
+`
+
+      // Make API request
+      const response = await makeGroqRequest(apiKey, prompt, 1500)
+
+      // Parse response
+      const result = safeJsonParse(response)
+
+      // Store result and navigate
+      sessionStorage.setItem("analysisResult", JSON.stringify(result))
+      router.push("/optimize")
     } catch (error) {
       console.error("Error:", error)
       alert(`Analysis failed: ${error.message}`)
@@ -135,22 +198,7 @@ export default function HomePage() {
     }
   }
 
-  if (apiKeyStatus === "checking") {
-    return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center">
-        <Card className="w-full max-w-md">
-          <CardContent className="flex items-center justify-center p-6">
-            <div className="text-center">
-              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-4"></div>
-              <p>Checking API configuration...</p>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-    )
-  }
-
-  if (showApiKeySetup || apiKeyStatus === "missing" || apiKeyStatus === "invalid") {
+  if (showApiKeySetup || !apiKeyValid) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center">
         <Card className="w-full max-w-2xl">
@@ -202,11 +250,7 @@ export default function HomePage() {
                   placeholder="gsk_..."
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
-                  className={apiKeyStatus === "invalid" ? "border-red-500" : ""}
                 />
-                {apiKeyStatus === "invalid" && (
-                  <p className="text-sm text-red-600">Invalid API key. Please check and try again.</p>
-                )}
               </div>
 
               <Button onClick={handleApiKeySubmit} className="w-full" disabled={isValidatingKey || !apiKey.trim()}>
@@ -216,8 +260,8 @@ export default function HomePage() {
 
             <Alert>
               <AlertDescription className="text-xs">
-                <strong>Privacy Note:</strong> Your API key is only stored temporarily in your browser session and is
-                used solely to make requests to Groq's API. It is not stored on our servers.
+                <strong>Privacy Note:</strong> Your API key is stored locally in your browser and is used solely to make
+                requests to Groq's API. It is not sent to any other servers.
               </AlertDescription>
             </Alert>
           </CardContent>
@@ -248,7 +292,7 @@ export default function HomePage() {
             <CardHeader className="text-center">
               <Upload className="w-12 h-12 mx-auto text-blue-600 mb-2" />
               <CardTitle>Upload CV</CardTitle>
-              <CardDescription>Upload your current resume</CardDescription>
+              <CardDescription>Upload your current resume (TXT, PDF, DOC)</CardDescription>
             </CardHeader>
           </Card>
           <Card>
@@ -281,7 +325,7 @@ export default function HomePage() {
               <Input
                 id="cv-upload"
                 type="file"
-                accept=".pdf,.doc,.docx"
+                accept=".pdf,.doc,.docx,.txt"
                 onChange={handleFileUpload}
                 className="cursor-pointer"
               />
@@ -291,6 +335,9 @@ export default function HomePage() {
                   {cvFile.name} uploaded successfully
                 </p>
               )}
+              <p className="text-xs text-gray-500">
+                Note: For best results with GitHub Pages deployment, please use plain text (.txt) files
+              </p>
             </div>
 
             <div className="space-y-2">
@@ -304,24 +351,24 @@ export default function HomePage() {
               />
             </div>
 
-            <Tabs defaultValue="url" className="w-full">
+            <Tabs defaultValue="description" className="w-full">
               <TabsList className="grid w-full grid-cols-2">
-                <TabsTrigger value="url">Job URL</TabsTrigger>
+                <TabsTrigger value="url" disabled>
+                  Job URL (Not Available)
+                </TabsTrigger>
                 <TabsTrigger value="description">Job Description</TabsTrigger>
               </TabsList>
               <TabsContent value="url" className="space-y-2">
-                <Label htmlFor="job-url">Job Posting URL</Label>
-                <Input
-                  id="job-url"
-                  type="url"
-                  placeholder="https://example.com/job-posting"
-                  value={jobUrl}
-                  onChange={(e) => setJobUrl(e.target.value)}
-                />
-                <p className="text-sm text-gray-500">Paste the URL of the job posting you want to apply for</p>
+                <Alert>
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription>
+                    URL fetching is not available in the static GitHub Pages deployment due to CORS restrictions. Please
+                    copy and paste the job description instead.
+                  </AlertDescription>
+                </Alert>
               </TabsContent>
               <TabsContent value="description" className="space-y-2">
-                <Label htmlFor="job-desc">Job Description</Label>
+                <Label htmlFor="job-desc">Job Description *</Label>
                 <Textarea
                   id="job-desc"
                   placeholder="Paste the full job description here..."
@@ -337,7 +384,7 @@ export default function HomePage() {
               onClick={handleAnalyze}
               className="w-full"
               size="lg"
-              disabled={isLoading || !cvFile || !experienceSummary || (!jobUrl && !jobDescription)}
+              disabled={isLoading || !cvFile || !experienceSummary || !jobDescription}
             >
               {isLoading ? "Analyzing..." : "Analyze & Optimize CV"}
             </Button>
